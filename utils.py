@@ -16,7 +16,7 @@ def check_user_id(ctx, arg):
 
 
 def check_mention(ctx, arg):
-	match = re.match(r'<@!?(\d+)>', arg)
+	match = re.fullmatch(r'<@!?(\d+)>', arg)
 	if match:
 		user_id = match.group(1)
 		try:

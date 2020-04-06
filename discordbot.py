@@ -38,22 +38,80 @@ leaderboard_roles = (
 
 guild_id = 696496775292387369
 
-async def add_pogs(user_id, amount):
+cheater_role_id = 696523006759010415
+
+async def add_pogs(user_id, amount, cheater=None):
+	if cheater is None:
+		cheater = await is_cheater(user_id)
+	to_inc = {
+		'pog_count': amount,
+	}
+	if cheater:
+		to_inc['cheater_pog_count'] = amount
+	else:
+		to_inc['current_pog_count'] = amount
+	if amount < 0:
+		del to_inc['pog_count']
 	await pog_count_coll.update_one(
 		{
 			'id': user_id
 		},
 		{
-			'$inc': {
-				'pog_count': amount,
-				'current_pog_count': amount,
-			}
+			'$inc': to_inc
 		},
 		upsert=True
 	)
 
 async def add_pog(user_id):
 	await add_pogs(user_id, 1)
+
+async def set_cheater(user_id):
+	data = await get_data(user_id)
+	if data.get('cheater') is True:
+		return
+	print('Setting', user_id, 'as cheater')
+	await pog_count_coll.update_one(
+		{
+			'id': user_id
+		},
+		{
+			'$set': {
+				'cheater': True,
+				'updated': 2,
+				'cheater_pog_count': data['current_pog_count'],
+				'current_pog_count': 0,
+			}
+		},
+		upsert=True
+	)
+
+async def del_cheater(user_id):
+	data = await get_data(user_id)
+	if data.get('cheater') is False:
+		return
+	print('Setting', user_id, 'as not cheater')
+	await pog_count_coll.update_one(
+		{
+			'id': user_id
+		},
+		{
+			'$set': {
+				'cheater': True,
+				'updated': 2,
+			}
+		},
+		upsert=True
+	)
+
+async def is_cheater(user_id):
+	doc = await get_data(user_id)
+	return doc.get('cheater', False)
+
+def has_cheater_role(member):
+	for role in member.roles:
+		if role.id == cheater_role_id:
+			return True
+	return False
 
 async def set_pogs(user_id, amount):
 	await pog_count_coll.update_one(
@@ -64,26 +122,54 @@ async def set_pogs(user_id, amount):
 			'$set': {
 				'pog_count': amount,
 				'current_pog_count': amount,
-				'updated': True
+				'cheater_pog_count': amount,
+				'updated': 2
 			}
 		},
 		upsert=True
 	)
 
-async def get_pogs(user_id, current=True):
-	doc = await pog_count_coll.find_one({
-		'id': user_id
-	})
-	if not doc.get('updated'):
-		await set_pogs(user_id, doc['pog_count'])
-		doc = await pog_count_coll.find_one({
-			'id': user_id
-		})
+async def get_pogs(user_id, current=True, cheater=None):
+	doc = await get_data(user_id)
+
+	if cheater is None:
+		if 'cheater' in doc:
+			cheater = doc['cheater']
+			if cheater:
+				return doc.get('cheater_pog_count', 0)
+	if cheater is True:
+		return doc.get('cheater_pog_count', 0)
 
 	if current:
 		return doc['current_pog_count']
 	else:
 		return doc['pog_count']
+		
+async def get_data(user_id):
+	doc = await pog_count_coll.find_one({
+		'id': user_id
+	})
+	if doc is None:
+		await pog_count_coll.update_one(
+			{
+				'id': user_id
+			},
+			{
+				'$inc': {
+					'pog_count': 0,
+					'current_pog_count': 0,
+				}
+			},
+			upsert=True
+		)
+		return await get_data(user_id)
+
+	if not doc.get('updated'):
+		await set_pogs(user_id, doc['current_pog_count'])
+		doc = await pog_count_coll.find_one({
+			'id': user_id
+		})
+	return doc
 		
 
 
@@ -115,7 +201,7 @@ async def update_leaderboard():
 	})
 	old_leaderboard = leaderboard_tmp['leaderboard']
 	leaderboard = []
-	async for user in pog_count_coll.find({}).sort('pog_count', -1).limit(5):
+	async for user in pog_count_coll.find({}).sort('current_pog_count', -1).limit(5):
 		leaderboard.append(user['id'])
 
 	removed_users = []
@@ -155,8 +241,10 @@ async def on_ready():
 	
 
 def check_is_pog(message):
+	message_original = message
 	pog_letter_before = '---'
 	message = re.sub(r'<a?:([a-zA-Z0-9]*)(pog)([a-zA-Z0-9]*):([0-9]+)>', '', message, flags=re.IGNORECASE)
+	has_emojis = message != message_original
 	for char in message:
 		char = char.lower()
 		if char == 'p' and pog_letter_before not in {'p','g','---'}:
@@ -176,10 +264,14 @@ def check_is_pog(message):
 		if char not in '!?.pogers ':
 			return False
 	if pog_letter_before not in 'grs':
+		if has_emojis and pog_letter_before == '---':
+			return True
 		return False
 	return True
 
 last_slow_pog_times = {}
+
+cheaters = set()
 
 @client.event
 async def on_message(message):
@@ -188,6 +280,14 @@ async def on_message(message):
 		return
 	if not check_is_pog(message.content):
 		return await message.delete()
+	if has_cheater_role(message.author):
+		if message.author.id not in cheaters:
+			await set_cheater(message.author.id)
+			cheaters.add(message.author.id)
+	else:
+		if message.author.id in cheaters:
+			await del_cheater(message.author.id)
+			cheaters.remove(message.author.id)
 	if message.channel.id == slow_pog_channel_id:
 		client.pog_count += 20
 		last_slow_pog_times[message.author.id] = time.time()
@@ -227,10 +327,10 @@ def start_bot():
 async def leaderboard(message, lb_max:int=5):
 	m = []
 	pos = 0
-	async for user in pog_count_coll.find({}).sort('pog_count', -1).limit(lb_max):
+	async for user in pog_count_coll.find({}).sort('current_pog_count', -1).limit(lb_max):
 		pos += 1
 		id = user['id']
-		count = user['pog_count']
+		count = user['current_pog_count']
 		m.append(
 			f'#{pos} - <@{id}> ({count})'
 		)
@@ -239,10 +339,28 @@ async def leaderboard(message, lb_max:int=5):
 		description='\n'.join(m)
 	))
 
+@betterbot.command('cheaterboard', aliases=['cheaterboards', 'cb'])
+async def cheater_leaderboard(message, lb_max:int=5):
+	m = []
+	pos = 0
+	async for user in pog_count_coll.find({}).sort('cheater_pog_count', -1).limit(lb_max):
+		pos += 1
+		id = user['id']
+		count = user.get('cheater_pog_count', 0)
+		m.append(
+			f'#{pos} - <@{id}> ({count})'
+		)
+	await message.channel.send(embed=discord.Embed(
+		title='Cheater leaderboard',
+		description='\n'.join(m)
+	))
+
 @betterbot.command('setpogs')
 async def setpogs(message, user:utils.Member, amount:int):
 	print(amount)
 	if message.author.id != 224588823898619905:
+		return
+	if amount is None:
 		return
 	await set_pogs(user.id, amount)
 	await message.channel.send(embed=discord.Embed(
@@ -254,10 +372,45 @@ async def check_pogs(message, user:utils.Member=None):
 	if user is None:
 		user = message.author
 	pog_count = await get_pogs(user.id)
+	doc = await get_data(user.id)
+	pog_count = doc['current_pog_count']
+	cheater_pogs = doc.get('cheater_pog_count')
 	if user == message.author:
-		msg = f'You have **{pog_count}** pogs'
+		title = 'Your pogs'
+		msg = f'Pogs: **{pog_count}**'
 	else:
-		msg = f'<@{user.id}> has **{pog_count}** pogs'
+		title = f'{user}\'s pogs'
+		msg = f'Pogs: **{pog_count}**'
+	if cheater_pogs:
+		msg += f'\nCheater pogs: **{cheater_pogs}**'
+	
+	await message.channel.send(embed=discord.Embed(
+		title=title,
+		description=msg
+	))
+
+@betterbot.command('realpogs')
+async def check_real_pogs(message, user:utils.Member=None):
+	if user is None:
+		user = message.author
+	pog_count = await get_pogs(user.id, cheater=False)
+	if user == message.author:
+		msg = f'You have **{pog_count}** real pogs'
+	else:
+		msg = f'<@{user.id}> has **{pog_count}** real pogs'
+	await message.channel.send(embed=discord.Embed(
+		description=msg
+	))
+
+@betterbot.command('cheaterpogs')
+async def check_cheater_pogs(message, user:utils.Member=None):
+	if user is None:
+		user = message.author
+	pog_count = await get_pogs(user.id, cheater=True)
+	if user == message.author:
+		msg = f'You have **{pog_count}** cheater pogs'
+	else:
+		msg = f'<@{user.id}> has **{pog_count}** cheater pogs'
 	await message.channel.send(embed=discord.Embed(
 		description=msg
 	))
@@ -288,8 +441,15 @@ async def gift_pogs(message, user:utils.Member, amount:int):
 		return await message.send('Invalid amount')
 	elif user is None:
 		return await message.send('Invalid user')
-	gifter_pog_count = await get_pogs(message.author.id)
-	giftee_pog_count = await get_pogs(user.id)
+
+	is_cheater_pogs = await is_cheater(message.author.id)
+
+	if is_cheater_pogs:
+		gifter_pog_count = await get_pogs(message.author.id, cheater=True)
+		giftee_pog_count = await get_pogs(user.id, cheater=True)
+	else:
+		gifter_pog_count = await get_pogs(message.author.id)
+		giftee_pog_count = await get_pogs(user.id)
 
 	if amount > gifter_pog_count:
 		return await message.send("You don't have enough pogs to do that")
